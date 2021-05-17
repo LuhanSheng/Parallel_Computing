@@ -21,7 +21,6 @@
 // as this file will be replaced with a different version for assessment.
 #include "cwk2_extra.h"
 
-
 //
 // Main.
 //
@@ -52,17 +51,17 @@ int main( int argc, char **argv )
     }
 
     // Load the full data set onto rank 0.
-    float *globalData = NULL;
+    float*globalData = NULL;
     int globalSize = 0;
     if( rank==0 )
     {
-        globalData = readDataFromFile( &globalSize );           // globalData must be free'd on rank 0 before quitting.
+        globalData = readDataFromFile(&globalSize);           // globalData must be free'd on rank 0 before quitting.
         if( globalData==NULL )
         {
             MPI_Finalize();                                     // Should really communicate to all other processes that they need to quit as well ...
             return EXIT_FAILURE;
         }
-        //printf("data1:%f\n",globalData[0]);
+
         printf( "Rank 0: Read in data set with %d floats.\n", globalSize );
     }
 
@@ -78,70 +77,46 @@ int main( int argc, char **argv )
     //
     // Task 1: Calculate the mean using all available processes.
     //
-    MPI_Bcast(&localSize,1,MPI_FLOAT,0,MPI_COMM_WORLD); //Broadcast localSize
-    MPI_Bcast(&globalSize,1,MPI_FLOAT,0,MPI_COMM_WORLD); //Broadcast globalSize
 
-    // All ranks can now allocate memory for their local arrays.
-    float *localData = (float*)malloc( localSize*sizeof(float));
-    if( !localData )
-  	{
-  		printf( "Could not allocate memory for the local data array on rank %d.\n", rank );
-  		MPI_Finalize();
-  		return EXIT_FAILURE;
-  	}
-
-    // Collective version: Use MPI_Scatter.
-  	MPI_Scatter(
-  		globalData, localSize, MPI_FLOAT,						// Data being sent.
-  		localData , localSize, MPI_FLOAT,						// Data being received.
-  		0, MPI_COMM_WORLD									// Source rank and communicator - no tag!
-  	);
-
-    // Each process calculates their local mean.
-    float local_sum = 0.0f;
-    for( i=0; i<localSize; i++){
-      local_sum += localData[i];
-    }
-    float local_mean = local_sum/globalSize;
-
-    // Use MPI_Reduce() to get the answer back on root 0.
+    // Broadcast globalSize and localSize
+    MPI_Bcast(&globalSize, 1, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&localSize, 1, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    float*localData = (float*)malloc(localSize*sizeof(float));
+    MPI_Scatter(globalData, localSize, MPI_FLOAT, localData , localSize, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    // Local mean.
+    float localSum = 0.0;
+    for(i = 0; i < localSize; i++) localSum = localSum + localData[i];
+    float localMean = localSum / globalSize;
+    // Return the local mean to the process 0
     float mean;
-    MPI_Reduce(&local_mean, &mean, 1, MPI_FLOAT, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&localMean, &mean, 1, MPI_FLOAT, MPI_SUM, 0, MPI_COMM_WORLD);
+
 
     //
     // Task 2. Calculate the variance using all processes.
     //
 
-    MPI_Bcast(&mean,1,MPI_FLOAT,0,MPI_COMM_WORLD);
-
-    // Each process calculates their local variance.
-    float local_sumSqrd = 0.0f;
-    for( i=0; i<localSize; i++){
-      local_sumSqrd += (localData[i]-mean)*(localData[i]-mean);
+    // Broadcast mean
+    MPI_Bcast(&mean, 1, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    // Local variance.
+    float localSumSqrd = 0.0;
+    for(i = 0; i < localSize; i++) localSumSqrd = localSumSqrd + (localData[i] - mean) * (localData[i] - mean);
+    float localVariance = localSumSqrd / globalSize;
+    // Use point-to-point communication in a binary tree, halfProcess means only one node is in the tree
+    while(1){
+        int halfProcess = numProcs / 2;
+        if(halfProcess == 0) break;
+        if(rank > halfProcess - 1){
+            MPI_Send(&localVariance, 1, MPI_FLOAT, rank - halfProcess, 0, MPI_COMM_WORLD);
+            break;
+        }else{
+            float receivedVariance;
+            MPI_Recv(&receivedVariance, 1, MPI_FLOAT, rank + halfProcess, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            localVariance = localVariance + receivedVariance;
+            numProcs = halfProcess;
+        }
     }
-    float local_variance = local_sumSqrd/globalSize;
-
-    // Use Point-to-point communication arranged in Binary trees to get the answer back on root 0.
-    //Second version in lec11
-    int final = 1;
-    int treeSize = numProcs;
-    while(final && treeSize!=1){ //when nodes become 1, we are in the end
-
-      if(rank>(treeSize/2-1)){ //the nodes after a half should send data
-        MPI_Send(&local_variance,1,MPI_FLOAT,rank-treeSize/2,0,MPI_COMM_WORLD);
-        final=0;
-      }
-      else{
-        float recv_variance;
-        MPI_Recv(&recv_variance,1,MPI_FLOAT,rank+treeSize/2,0,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-        local_variance += recv_variance;
-        treeSize = treeSize/2;
-
-        if(treeSize==1)
-          final =0;
-      }
-    }
-
+    
     //
     // Output the results alongside a serial check.
     //
@@ -153,7 +128,7 @@ int main( int argc, char **argv )
         // Your code MUST call this function after the mean and variance have been calculated using your parallel algorithms.
         // Do not modify the function itself (which is defined in 'cwk2_extra.h'), as it will be replaced with a different
         // version for the purpose of assessing. Also, don't just put the values from serial calculations here or you will lose marks.
-        finalMeanAndVariance( mean, local_variance );
+        finalMeanAndVariance(mean, localVariance);
             // You should replace the first argument with your mean, and the second with your variance.
 
         // Check the answers against the serial calculations. This also demonstrates how to perform the calculations
@@ -178,8 +153,9 @@ int main( int argc, char **argv )
     // Free all resources (including any memory you have dynamically allocated), then quit.
     //
     if( rank==0 ) free( globalData );
-    free( localData );
-
+    
+    free(localData);
+    
     MPI_Finalize();
 
     return EXIT_SUCCESS;
